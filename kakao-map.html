@@ -1,0 +1,36 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Kakao 지도 시작하기</title>
+  <style>
+    html,body{margin:0;padding:0}
+    #map{width:100%;height:400px}
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <script>
+    // URL 예: .../kakao-map.html?appkey=JS키&lat=37.5&lng=126.9&level=3
+    const qs = new URLSearchParams(location.search);
+    const APPKEY = qs.get('appkey');
+    const lat    = parseFloat(qs.get('lat')  ?? '33.450701');
+    const lng    = parseFloat(qs.get('lng')  ?? '126.570667');
+    const level  = parseInt(qs.get('level') ?? '3', 10);
+    if (!APPKEY) { alert('appkey 누락'); throw new Error('appkey required'); }
+
+    // 가이드 그대로: SDK 스크립트 먼저 로딩
+    const s = document.createElement('script');
+    s.src = `//dapi.kakao.com/v2/maps/sdk.js?appkey=${encodeURIComponent(APPKEY)}`;
+    s.onload = () => {
+      const container = document.getElementById('map');
+      const options = { center: new kakao.maps.LatLng(lat, lng), level };
+      new kakao.maps.Map(container, options);
+      console.log('Kakao map initialized', { lat, lng, level });
+    };
+    s.onerror = () => { console.error('Kakao SDK 로드 실패(도메인/키 확인)'); alert('Kakao SDK 로드 실패'); };
+    document.head.appendChild(s);
+  </script>
+</body>
+</html>
