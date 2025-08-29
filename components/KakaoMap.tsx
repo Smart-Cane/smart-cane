@@ -10,10 +10,7 @@ interface KakaoMapProps {
 }
 
 const KakaoMap: React.FC<KakaoMapProps> = ({ lat, lng, level = 3 }) => {
-    //  //API 키 로딩 상태 로그 -> 잘 출력 됨.
-  console.log('환경변수 API_KEY:', API_KEY);
-  console.log('API_KEY 길이:', API_KEY?.length);
-  console.log('API_KEY가 비어있는가:', !API_KEY || API_KEY === '');
+
   const htmlContent = `
     <!DOCTYPE html>
     <html>
