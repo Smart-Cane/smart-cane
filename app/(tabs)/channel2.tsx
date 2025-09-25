@@ -1,6 +1,7 @@
 // app/(tabs)/channel2.tsx
 import * as Location from "expo-location";
-import React, { useEffect, useMemo, useState } from "react";
+import * as Speech from "expo-speech";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -14,43 +15,162 @@ import {
 } from "react-native";
 import { WebView } from "react-native-webview";
 
-const API_KEY = process.env.EXPO_PUBLIC_KAKAO_JS_KEY ?? "";
+const API_KEY = process.env.EXPO_PUBLIC_KAKAO_JS_KEY ?? ""; // Kakao JS 지도 표시용
 
 type Coord = { lat: number; lng: number };
 type SearchItem = { id: string; title: string; lat: number; lng: number };
 
+type OsrmStep = {
+  distance: number;
+  duration: number;
+  name: string;
+  geometry?: any;
+  intersections?: any[];
+  maneuver: {
+    type:
+      | "depart"
+      | "arrive"
+      | "turn"
+      | "new name"
+      | "merge"
+      | "on ramp"
+      | "off ramp"
+      | "fork"
+      | "roundabout"
+      | "rotary"
+      | "end of road"
+      | "continue"
+      | "use lane";
+    modifier?:
+      | "uturn"
+      | "sharp right"
+      | "right"
+      | "slight right"
+      | "straight"
+      | "slight left"
+      | "left"
+      | "sharp left";
+    location: [number, number]; // [lon, lat]
+    exit?: number; // roundabout
+  };
+};
+
+function haversine(a: Coord, b: Coord) {
+  const R = 6371000;
+  const dLat = ((b.lat - a.lat) * Math.PI) / 180;
+  const dLng = ((b.lng - a.lng) * Math.PI) / 180;
+  const lat1 = (a.lat * Math.PI) / 180;
+  const lat2 = (b.lat * Math.PI) / 180;
+  const s =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+
+function speakKo(s: string) {
+  try {
+    Speech.stop();
+    Speech.speak(s, { language: "ko-KR", pitch: 1.0, rate: 1.0 });
+  } catch {}
+}
+
+function phraseFromStep(step: OsrmStep, when: "ahead" | "now") {
+  const m = step.maneuver;
+  const distM = Math.max(0, Math.round(step.distance)); // fallback
+  const ahead = when === "ahead";
+  const baseAhead = (txt: string) => `${distM >= 20 ? `${Math.min(distM, 200)}미터 앞 ` : ""}${txt}`;
+  const baseNow = (txt: string) => `지금 ${txt}`;
+  const turnWord = (mod?: string) => {
+    switch (mod) {
+      case "left":
+      case "sharp left":
+      case "slight left":
+        return "좌회전하세요";
+      case "right":
+      case "sharp right":
+      case "slight right":
+        return "우회전하세요";
+      case "uturn":
+        return "유턴하세요";
+      case "straight":
+      default:
+        return "직진하세요";
+    }
+  };
+
+  switch (m.type) {
+    case "depart":
+      return ahead ? "안내를 시작합니다. 출발합니다." : "출발합니다.";
+    case "arrive":
+      return ahead ? "곧 목적지입니다." : "목적지에 도착했습니다.";
+    case "turn":
+    case "end of road":
+    case "continue":
+      return ahead ? baseAhead(turnWord(m.modifier)) : baseNow(turnWord(m.modifier));
+    case "on ramp":
+      return ahead ? baseAhead("램프로 진입하세요") : baseNow("램프로 진입하세요");
+    case "off ramp":
+      return ahead ? baseAhead("램프에서 빠져나가세요") : baseNow("램프에서 빠져나가세요");
+    case "fork":
+      return ahead ? baseAhead("갈림길에서 안내에 따라 진행하세요") : baseNow("갈림길 진행");
+    case "merge":
+      return ahead ? baseAhead("차로를 합류하세요") : baseNow("차로 합류");
+    case "roundabout":
+    case "rotary":
+      if (typeof m.exit === "number") {
+        const nth = `${m.exit}번째 출구`;
+        return ahead ? baseAhead(`로터리에서 ${nth}로 나가세요`) : baseNow(`로터리 ${nth}로 나가세요`);
+      }
+      return ahead ? baseAhead("로터리를 통과하세요") : baseNow("로터리를 통과하세요");
+    default:
+      return ahead ? baseAhead("안내를 따르세요") : "안내를 따르세요";
+  }
+}
+
 export default function Channel2() {
   const [start, setStart] = useState<Coord | null>(null);
   const [dest, setDest] = useState<Coord | null>(null);
-  const [route, setRoute] = useState<Coord[] | null>(null);
+  const [routeLine, setRouteLine] = useState<Coord[] | null>(null);
+  const [steps, setSteps] = useState<OsrmStep[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [q, setQ] = useState("");
   const [results, setResults] = useState<SearchItem[]>([]);
   const [searching, setSearching] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  // 1) 현재 위치를 출발지로 설정
+  const watchSub = useRef<Location.LocationSubscription | null>(null);
+  const nextIdxRef = useRef(0);
+  const announcedAheadRef = useRef<boolean>(false);
+  const lastSpeakTs = useRef<number>(0);
+
+  const AHEAD_DIST = 50; // m: 예고 안내
+  const NOW_DIST = 12; // m: 즉시 안내
+  const REROUTE_DIST = 80; // m: 경로 이탈 시 재탐색
+
   useEffect(() => {
     (async () => {
       try {
-        if (!API_KEY) throw new Error("EXPO_PUBLIC_KAKAO_JS_KEY 미설정");
         const { status } = await Location.requestForegroundPermissionsAsync();
-        if (status !== "granted") throw new Error("위치 권한 거부됨");
-
+        if (status !== "granted") throw new Error("위치 권한이 필요합니다");
         const pos = await Location.getCurrentPositionAsync({
           accuracy: Location.Accuracy.Balanced,
         });
-        const s = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-        setStart(s);
+        setStart({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+        speakKo("현재 위치를 출발지로 설정했습니다. 도착지를 검색해 주세요.");
       } catch (e: any) {
         setErr(e?.message ?? "현재 위치 확인 실패");
       } finally {
         setLoading(false);
       }
     })();
+    return () => {
+      watchSub.current?.remove();
+      watchSub.current = null;
+      Speech.stop();
+    };
   }, []);
 
-  // 2) 도착지 검색 (Nominatim)
+  // 검색: Nominatim
   const searchDest = async () => {
     const query = q.trim();
     if (!query) return;
@@ -61,10 +181,7 @@ export default function Channel2() {
         "https://nominatim.openstreetmap.org/search" +
         `?format=json&limit=8&addressdetails=0&q=${encodeURIComponent(query)}`;
       const res = await fetch(url, {
-        headers: {
-          // Nominatim 정책상 User-Agent 권장
-          "User-Agent": "smart-cane-app/1.0",
-        },
+        headers: { "User-Agent": "smart-cane-voice/1.0" },
       });
       if (!res.ok) throw new Error(`검색 실패 HTTP ${res.status}`);
       const arr: any[] = await res.json();
@@ -82,27 +199,47 @@ export default function Channel2() {
     }
   };
 
-  // 3) 경로 계산 (OSRM)
+  // 경로 계산(OSRM, steps=true)
   const fetchRoute = async (s: Coord, d: Coord) => {
     try {
       const url =
-        `https://router.project-osrm.org/route/v1/driving/` +
+        `https://router.project-osrm.org/route/v1/foot/` + // 보행자 경로: 필요에 따라 driving 로 변경
         `${s.lng},${s.lat};${d.lng},${d.lat}` +
-        `?overview=full&geometries=geojson`;
+        `?overview=full&geometries=geojson&steps=true`;
       const res = await fetch(url);
       if (!res.ok) throw new Error(`경로 HTTP ${res.status}`);
       const json = await res.json();
       const coords: [number, number][] | undefined =
         json?.routes?.[0]?.geometry?.coordinates;
-      if (!coords?.length) throw new Error("경로 좌표 없음");
-      setRoute(coords.map(([lng, lat]) => ({ lat, lng })));
+      const legSteps: OsrmStep[] | undefined = json?.routes?.[0]?.legs?.[0]?.steps;
+      if (!coords?.length || !legSteps?.length) throw new Error("경로 또는 단계 정보 없음");
+
+      setRouteLine(coords.map(([lng, lat]) => ({ lat, lng })));
+      setSteps(legSteps);
+      nextIdxRef.current = 0;
+      announcedAheadRef.current = false;
+
+      speakKo("경로를 안내합니다. 안전에 유의하세요.");
+
+      // 위치 추적 시작 / 재시작
+      watchSub.current?.remove();
+      watchSub.current = await Location.watchPositionAsync(
+        {
+          accuracy: Location.Accuracy.High,
+          timeInterval: 1500,
+          distanceInterval: 2,
+        },
+        (pos) => onLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude }, legSteps)
+      );
     } catch (e: any) {
       Alert.alert("경로 오류", e?.message ?? "경로 계산 실패");
-      setRoute(null);
+      setRouteLine(null);
+      setSteps(null);
+      watchSub.current?.remove();
+      watchSub.current = null;
     }
   };
 
-  // 검색 결과 선택 → 도착지 확정 및 경로 조회
   const onPickDest = (item: SearchItem) => {
     const d = { lat: item.lat, lng: item.lng };
     setDest(d);
@@ -110,83 +247,92 @@ export default function Channel2() {
     if (start) fetchRoute(start, d);
   };
 
-  // 4) Kakao 지도를 그릴 HTML
+  function onLocation(me: Coord, stepList: OsrmStep[]) {
+    const nowTs = Date.now();
+    // 과도한 반복 방지
+    if (nowTs - lastSpeakTs.current < 900) {
+      // 0.9s 내 재발화 금지
+    }
+
+    // 경로 이탈 감지(간단: 경로 선분 중 최소 거리 > 임계)
+    if (routeLine && routeLine.length > 2) {
+      let min = Number.POSITIVE_INFINITY;
+      for (let i = 1; i < routeLine.length; i++) {
+        const a = routeLine[i - 1],
+          b = routeLine[i];
+        // 점-선분 거리 근사: 두 끝점 거리의 최소값으로 간략화(실서비스는 정확한 점-선분 거리 사용 권장)
+        min = Math.min(min, haversine(me, a), haversine(me, b));
+        if (min < 5) break;
+      }
+      if (min > REROUTE_DIST && dest) {
+        speakKo("경로에서 벗어났습니다. 경로를 재탐색합니다.");
+        fetchRoute(me, dest);
+        return;
+      }
+    }
+
+    const i = nextIdxRef.current;
+    if (i >= stepList.length) return;
+
+    const step = stepList[i];
+    const target: Coord = { lat: step.maneuver.location[1], lng: step.maneuver.location[0] };
+    const d = haversine(me, target);
+
+    // 예고
+    if (!announcedAheadRef.current && d <= AHEAD_DIST && d > NOW_DIST) {
+      speakKo(phraseFromStep(step, "ahead"));
+      announcedAheadRef.current = true;
+      lastSpeakTs.current = nowTs;
+      return;
+    }
+    // 즉시
+    if (d <= NOW_DIST) {
+      speakKo(phraseFromStep(step, "now"));
+      nextIdxRef.current = i + 1;
+      announcedAheadRef.current = false;
+      lastSpeakTs.current = nowTs;
+
+      // 도착 단계 다음에 끝
+      if (step.maneuver.type === "arrive") {
+        watchSub.current?.remove();
+        watchSub.current = null;
+      }
+    }
+  }
+
+  // Kakao 지도 HTML (경로 미리보기)
   const html = useMemo(() => {
     if (!start) return null;
     const s = JSON.stringify(start);
     const d = JSON.stringify(dest);
-    const r = JSON.stringify(route ?? []);
-
+    const r = JSON.stringify(routeLine ?? []);
     return `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
-  <style>
-    html, body, #map { margin:0; padding:0; width:100%; height:100%; }
-    .badge {
-      position:absolute; top:8px; left:8px; background:#111827; color:#fff;
-      padding:6px 10px; border-radius:8px; font-family:system-ui, sans-serif; font-size:12px; opacity:.9;
+<html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<style>html,body,#map{margin:0;padding:0;width:100%;height:100%} .badge{position:absolute;top:8px;left:8px;background:#111827;color:#fff;padding:6px 10px;border-radius:8px;font-family:sans-serif;font-size:12px;opacity:.9}</style>
+</head><body>
+<div id="map"></div><div class="badge">음성 길안내(미리보기)</div>
+<script>(function(){
+  const API_KEY='${API_KEY}';
+  const START=${s};
+  const DEST=${d};
+  const ROUTE=${r};
+  function load(){return new Promise((ok,ng)=>{var s=document.createElement('script');s.src='https://dapi.kakao.com/v2/maps/sdk.js?appkey='+API_KEY+'&autoload=false';s.onload=ok;s.onerror=ng;document.head.appendChild(s);});}
+  function init(){
+    var map=new kakao.maps.Map(document.getElementById('map'),{center:new kakao.maps.LatLng(START.lat,START.lng),level:4});
+    new kakao.maps.Marker({position:new kakao.maps.LatLng(START.lat,START.lng),map});
+    if(DEST) new kakao.maps.Marker({position:new kakao.maps.LatLng(DEST.lat,DEST.lng),map});
+    if(ROUTE&&ROUTE.length){
+      var line=ROUTE.map(p=>new kakao.maps.LatLng(p.lat,p.lng));
+      new kakao.maps.Polyline({path:line,strokeWeight:5,strokeColor:'#2563EB',strokeOpacity:.9,strokeStyle:'solid'}).setMap(map);
+      var b=new kakao.maps.LatLngBounds(); line.forEach(ll=>b.extend(ll)); map.setBounds(b,32,32,32,32);
     }
-  </style>
-</head>
-<body>
-  <div id="map"></div>
-  <div class="badge">경로 미리보기</div>
-  <script>
-    (function(){
-      const API_KEY = '${API_KEY}';
-      const START = ${s};
-      const DEST  = ${d};
-      const ROUTE = ${r};
+  }
+  load().then(()=>kakao.maps.load(init)).catch(()=>{document.body.innerHTML='<div style="padding:16px;font-family:sans-serif">Kakao SDK 로드 실패</div>';});
+})();</script>
+</body></html>`;
+  }, [start, dest, routeLine]);
 
-      function loadSDK(){
-        return new Promise(function(resolve, reject){
-          var s = document.createElement('script');
-          s.src = 'https://dapi.kakao.com/v2/maps/sdk.js?appkey=' + API_KEY + '&autoload=false';
-          s.onload = resolve; s.onerror = reject;
-          document.head.appendChild(s);
-        });
-      }
-      function init(){
-        var center = new kakao.maps.LatLng(START.lat, START.lng);
-        var map = new kakao.maps.Map(document.getElementById('map'), { center:center, level:4 });
-
-        // 출발 마커
-        new kakao.maps.Marker({ position: center, map });
-
-        // 도착 마커
-        if (DEST) {
-          new kakao.maps.Marker({
-            position: new kakao.maps.LatLng(DEST.lat, DEST.lng),
-            map
-          });
-        }
-
-        // 경로 라인
-        if (ROUTE && ROUTE.length){
-          var linePath = ROUTE.map(function(p){ return new kakao.maps.LatLng(p.lat, p.lng); });
-          var polyline = new kakao.maps.Polyline({
-            path: linePath, strokeWeight: 5, strokeColor: '#2563EB', strokeOpacity: .9, strokeStyle: 'solid'
-          });
-          polyline.setMap(map);
-
-          // 화면 맞춤
-          var bounds = new kakao.maps.LatLngBounds();
-          linePath.forEach(function(ll){ bounds.extend(ll); });
-          map.setBounds(bounds, 32, 32, 32, 32);
-        } else {
-          map.setCenter(center);
-        }
-      }
-      loadSDK().then(function(){ kakao.maps.load(init); })
-               .catch(function(){ document.body.innerHTML = '<div style="padding:16px;font-family:sans-serif">Kakao SDK 로드 실패</div>'; });
-    })();
-  </script>
-</body>
-</html>`;
-  }, [start, dest, route]);
-
+  // UI 상태
   if (loading) {
     return (
       <View style={{ flex: 1, alignItems: "center", justifyContent: "center" }}>
@@ -235,7 +381,7 @@ export default function Channel2() {
       >
         <View style={{ flexDirection: "row", gap: 8 }}>
           <TextInput
-            placeholder="도착지 검색(예: 경복궁)"
+            placeholder="도착지 검색(예: 서울역)"
             value={q}
             onChangeText={setQ}
             onSubmitEditing={searchDest}
@@ -261,7 +407,6 @@ export default function Channel2() {
           </TouchableOpacity>
         </View>
 
-        {/* 검색 결과 목록 */}
         {searching ? (
           <View style={{ paddingVertical: 6 }}>
             <ActivityIndicator />
@@ -270,12 +415,8 @@ export default function Channel2() {
           <FlatList
             data={results}
             keyExtractor={(it) => it.id}
-            style={{
-              maxHeight: 260,
-              borderTopWidth: 1,
-              borderColor: "#E5E7EB",
-              marginTop: 4,
-            }}
+            style={{ maxHeight: 260, borderTopWidth: 1, borderColor: "#E5E7EB", marginTop: 4 }}
+            keyboardShouldPersistTaps="handled"
             renderItem={({ item }) => (
               <TouchableOpacity
                 onPress={() => onPickDest(item)}
